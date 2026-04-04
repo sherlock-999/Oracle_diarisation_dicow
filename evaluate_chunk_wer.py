@@ -12,13 +12,13 @@ Pipeline per file:
 import re
 import sys
 import argparse
-import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple
 from collections import defaultdict
 
 import numpy as np
 import soundfile as sf
+import librosa
 import torch
 import yaml
 import jiwer
@@ -116,28 +116,22 @@ def transcribe_audio(
 
     per_spk_hyps: Dict[str, List[str]] = {spk: [] for spk in speakers}
 
-    # DiCoW_Pipeline.preprocess() reads audio from disk
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp_path = tmp.name
-
     try:
         for idx in range(num_chunks):
             chunk_start = idx * chunk_length_s
             chunk_end   = min(chunk_start + chunk_length_s, total_duration)
 
-            # Audio chunk — pass the raw slice; feature extractor pads to 30s internally
             s0 = idx * chunk_samples
             s1 = min(s0 + chunk_samples, len(audio))
             chunk_audio = audio[s0:s1]
-            sf.write(tmp_path, chunk_audio, sr)
 
             # Slice the full mask to get this chunk's diarization
             f_start = round(chunk_start * _DIAR_FPS)
             f_end   = round(chunk_end   * _DIAR_FPS)
             pipeline.diarization_mask = full_diar_mask[:, f_start:f_end]
 
-            # Run DiCoW
-            result          = pipeline({"audio_filepath": tmp_path}, return_timestamps=True)
+            # Pass array directly — no disk write/read
+            result          = pipeline({"array": chunk_audio, "sampling_rate": sr}, return_timestamps=True)
             per_spk_outputs = result["per_spk_outputs"]  # list[str] with <|timestamp|> tokens
 
             for i, spk in enumerate(speakers):
@@ -147,7 +141,6 @@ def transcribe_audio(
 
     finally:
         pipeline.diarization_mask = None
-        Path(tmp_path).unlink(missing_ok=True)
 
     return {spk: " ".join(per_spk_hyps[spk]) for spk in speakers}
 
@@ -168,10 +161,7 @@ def evaluate_file(
     """
     references = load_reference(tg_path)
 
-    audio, sr = sf.read(audio_path, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio[:, 0]
-    assert sr == 16_000, f"Expected 16 kHz audio, got {sr} Hz"
+    audio, sr = librosa.load(audio_path, sr=16_000, mono=True)  # resample once here
 
     speakers, full_diar_mask = load_diarization_mask(rttm_path, len(audio) / sr)
     hypotheses = transcribe_audio(audio, sr, speakers, full_diar_mask, pipeline, chunk_length_s)
@@ -187,8 +177,9 @@ def evaluate_file(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_pipeline(model_path: str, device: torch.device) -> DiCoW_Pipeline:
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
     model = DiCoWForConditionalGeneration.from_pretrained(
-        model_path, local_files_only=True
+        model_path, local_files_only=True, torch_dtype=dtype
     ).to(device)
     feature_extractor = AutoFeatureExtractor.from_pretrained(model_path, local_files_only=True)
     tokenizer         = AutoTokenizer.from_pretrained(model_path, local_files_only=True)

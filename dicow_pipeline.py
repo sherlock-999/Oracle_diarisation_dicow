@@ -51,59 +51,39 @@ class DiCoW_Pipeline(AutomaticSpeechRecognitionPipeline):
     ############################################
     def preprocess(self, inputs, chunk_length_s=0, stride_length_s=None):
 
-        mixed_audio_path = inputs["audio_filepath"]
-        # enrollment_audio_path = inputs.get("enrollment_audio_path", None)
-
-        print("+--------------------------------+")
-        print("|          Preprocessing         |")
-        print("+--------------------------------+")
-
-        ####################################################
-        # 1️⃣ Resample audio
-        ####################################################
-        print("1. Resampling audio to 16kHz...")
-
-        mixed_input_aud, sr = libr_load(mixed_audio_path, sr=16000, mono=True)
-        sf_write(mixed_audio_path, mixed_input_aud, sr, format="wav")
-
-        print("input to diarization:", mixed_audio_path)
-        print()
+        # Accept either {"array": np.ndarray, "sampling_rate": int} (preferred — pre-resampled)
+        # or {"audio_filepath": path} (resamples on the fly, slower)
+        if "array" in inputs:
+            audio_input = {"array": inputs["array"], "sampling_rate": inputs["sampling_rate"]}
+        else:
+            mixed_audio_path = inputs["audio_filepath"]
+            audio_arr, sr = libr_load(mixed_audio_path, sr=16000, mono=True)
+            audio_input = {"array": audio_arr, "sampling_rate": sr}
 
         ####################################################
-        # 2️⃣ Load diarization mask
+        # Load diarization mask
         ####################################################
-        print("2. Loading diarization mask...")
-
-        # Use in-memory mask if available, otherwise load from disk
         if self.diarization_mask is not None:
             diarization_mask = self.diarization_mask
-            print("Using in-memory diarization mask")
         else:
-            audio_name = os.path.basename(mixed_audio_path).replace(".wav", "")
+            audio_name = os.path.basename(inputs.get("audio_filepath", "audio")).replace(".wav", "")
             diar_mask_path = os.path.join("diarisation_masks", f"{audio_name}_mask.pt")
             diarization_mask = torch.load(diar_mask_path)
-            print(f"Loaded mask from disk: {diar_mask_path}")
-
-        print("diarization_mask shape:", diarization_mask.shape)
 
         ####################################################
-        # 3️⃣ Run base Whisper preprocessing
+        # Run base Whisper preprocessing
         ####################################################
         generator = super().preprocess(
-            mixed_audio_path,
+            audio_input,
             chunk_length_s=chunk_length_s,
             stride_length_s=stride_length_s
         )
 
         samples = next(generator)
 
-        print("samples['input_features'] shape:", samples["input_features"].shape)
-        print()
-
         ####################################################
-        # 4️⃣ Create STNO masks
+        # Create STNO masks
         ####################################################
-        print("3. Creating STNO masks...")
 
         # Align diarization mask length to mel features (same as original DiCoW pipeline).
         # Original builds the mask at exactly input_features.shape[-1] // 2 by zero-initialising
