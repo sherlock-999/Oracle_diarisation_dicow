@@ -1,0 +1,16 @@
+# Paths to a single audio/annotation pair for evaluation
+audio_dir: /scratch/users/ntu/d230009/testset/nsf/audio/
+textgrid_dir: /scratch/users/ntu/d230009/testset/nsf/textgrid/
+rttm_dir: /scratch/users/ntu/d230009/testset/nsf/rttm/
+
+# Chunking
+chunk_length_s: 5.0
+
+# DiCoW model (downloaded automatically from HuggingFace if not cached)
+dicow_model: ./model/DiCoW
+
+# Device: "auto" selects cuda if available, else cpu
+device: auto
+
+# Where to write transcripts and WER results
+output_dir: ./output

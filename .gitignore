@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Model weights (large binary files — download separately)
+*.safetensors
+*.pt
+*.bin
+*.nemo
+
+# Output / logs
+log/
+*.log
+*.err
+*.out
+
+# Test data
+testset/
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+.cache/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
