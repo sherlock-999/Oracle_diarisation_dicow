@@ -1,13 +1,13 @@
 # DiCoW Chunk WER Evaluation
 
-Evaluates [DiCoW](https://huggingface.co/BUT-FIT/DiCoW_v3_2) (speaker-conditioned Whisper) on multi-speaker audio using oracle diarization, measuring WER at configurable chunk sizes.
+Evaluates [DiCoW](https://huggingface.co/BUT-FIT/DiCoW_v3_2) with oracle diarization. It writes oracle-labelled hypotheses and scores them using the shared, current `DiCoW_Experiments/scoring_dicow` checkout.
 
 ## Pipeline
 
-1. **Reference** — parse speaker transcripts from Praat TextGrid files
-2. **Diarization mask** — build a full binary `[num_speakers, total_frames]` mask at 50 fps from RTTM
-3. **Transcription** — chunk audio into fixed-length windows; for each chunk slice the mask and run DiCoW
-4. **WER** — normalize both hypothesis and reference with `EnglishTextNormalizer` (fillers, contractions, case), then compute macro WER (sum S/D/I/H across all speakers, divide once)
+1. **Oracle mask** — build `[num_speakers, total_frames]` activity masks from reference RTTM at 50 fps.
+2. **Transcription** — decode fixed-length chunks with those masks.
+3. **Hypotheses** — save one segment per RTTM speaker and chunk to `output/hypothesis_multi.jsonl`.
+4. **Scoring** — invoke the latest `scoring_dicow` in `oracle` mapping mode.
 
 ## Dataset layout
 
@@ -22,7 +22,7 @@ Evaluates [DiCoW](https://huggingface.co/BUT-FIT/DiCoW_v3_2) (speaker-conditione
 
 ```bash
 pip install -r requirements.txt
-# scoring_dicow is included as a subdirectory — no separate install needed
+# Install the shared scoring_dicow checkout separately, including its runtime dependencies.
 
 # Place the DiCoW model weights in:
 #   model/DiCoW/model.safetensors  (+ config.json, tokenizer files)
@@ -41,6 +41,11 @@ rttm_dir:      /path/to/dataset/rttm/
 chunk_length_s: 5.0          # chunk size in seconds
 dicow_model:   ./model/DiCoW # local model path
 output_dir:    ./output
+scoring_dicow_root: /path/to/DiCoW_Experiments/scoring_dicow
+testset_root: /path/to/dataset_root  # parent of nsf/, ami/, or l2m/
+dataset_name: nsf
+mapping: nsf
+collar: 5
 ```
 
 ## Run
@@ -49,14 +54,17 @@ output_dir:    ./output
 python evaluate_chunk_wer.py --config config.yaml
 ```
 
-Results are written to `output/<chunk_length>s.txt`, e.g. `output/5.0s.txt`:
+Results are written to:
 
+```text
+output/hypothesis_multi.jsonl
+output/scoring/diagnostic_sessions.jsonl
+output/scoring/run_summary.json
+output/scoring/normalized_eval/oracle_fixed_wer_average.norm.json
+output/scoring/normalized_eval/oracle_fixed_tcpwer_average.norm.json
 ```
-sdm_MTG_32000_sc_meetup_0-0  WER = 18.34%  (S=... D=... I=... H=...)
-...
 
-Overall WER = 0.2103
-```
+`oracle_fixed_*` does not permute speakers. It is the primary oracle TS-ASR metric because it exposes an incorrect target stream.
 
 ## File overview
 
@@ -66,4 +74,4 @@ Overall WER = 0.2103
 | `dicow_pipeline.py` | `DiCoW_Pipeline` — HuggingFace pipeline wrapper with diarization mask injection |
 | `dicow_inference.py` | `DiCoWTranscriber` and tokenizer utilities |
 | `config.yaml` | Runtime configuration |
-| `scoring_dicow/` | Text normalization and scoring utilities |
+| `scoring_dicow/` | Historical copy only. It is not used. Configure `scoring_dicow_root` to the shared current checkout. |

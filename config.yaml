@@ -12,5 +12,13 @@ dicow_model: ./model/DiCoW
 # Device: "auto" selects cuda if available, else cpu
 device: auto
 
-# Where to write transcripts and WER results
+# Where to write hypotheses and scoring artifacts
 output_dir: ./output
+
+# Shared scorer and dataset identity. This evaluator imports the current
+# checkout, not the stale scoring_dicow/ directory inside this experiment.
+scoring_dicow_root: /home/hesiyuan/Desktop/projects/DiCoW_Experiments/scoring_dicow
+testset_root: /scratch/users/ntu/d230009/testset
+dataset_name: nsf
+mapping: nsf
+collar: 5

@@ -1,32 +1,24 @@
 """
-Evaluate DiCoW WER on chunked audio using oracle diarization.
+Evaluate chunked DiCoW with oracle diarization and `scoring_dicow`.
 
 Pipeline per file:
-  1. load_reference(textgrid)              →  {speaker: transcript}
-  2. load_diarization_mask(rttm, duration) →  speakers, full_mask [num_spk, total_frames]
-  3. transcribe_audio(audio, full_mask)    →  {speaker: hypothesis}
-     - per chunk: pipeline.diarization_mask = full_mask[:, f_start:f_end]
-  4. Compute WER(reference, hypothesis) per speaker
+  1. load_diarization_mask(rttm, duration) → oracle speaker labels and mask
+  2. transcribe_audio(audio, full_mask)    → chunk-level hypothesis JSONL rows
+  3. score_dataset(...)                    → oracle fixed-label diagnostics
 """
 
 import re
 import sys
 import argparse
+import json
 from pathlib import Path
 from typing import Dict, List, Tuple
-from collections import defaultdict
 
 import numpy as np
-import soundfile as sf
 import librosa
 import torch
 import yaml
-import jiwer
 from tqdm import tqdm
-
-# Use scoring_dicow for TextGrid parsing and text normalization
-sys.path.insert(0, str(Path(__file__).parent / "scoring_dicow" / "src"))
-from scoring_dicow.reference import parse_textgrid, normalize_rows
 
 from transformers import AutoFeatureExtractor, AutoTokenizer
 from model.DiCoW.modeling_dicow import DiCoWForConditionalGeneration
@@ -38,24 +30,7 @@ _DIAR_FPS = 50  # frames per second used by DiCoW diarization mask
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 1 — Reference transcriptions from TextGrid
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_reference(textgrid_path: str) -> Dict[str, str]:
-    """
-    Parse a Praat TextGrid and return {speaker: transcript}.
-    Uses scoring_dicow's parse_textgrid() which handles clean_text (lowercase,
-    tag removal), then aggregates all intervals per speaker.
-    """
-    rows = parse_textgrid(Path(textgrid_path))
-    by_speaker: Dict[str, List[str]] = defaultdict(list)
-    for row in rows:
-        by_speaker[row["speaker"]].append(row["words"])
-    return {spk: " ".join(words) for spk, words in by_speaker.items()}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2 — Full diarization mask from RTTM
+# Step 1 — Full diarization mask from RTTM
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_diarization_mask(
@@ -94,7 +69,7 @@ def load_diarization_mask(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3 — Transcribe chunked audio
+# Step 2 — Transcribe chunked audio
 # ─────────────────────────────────────────────────────────────────────────────
 
 def transcribe_audio(
@@ -104,17 +79,18 @@ def transcribe_audio(
     full_diar_mask: torch.Tensor,
     pipeline: DiCoW_Pipeline,
     chunk_length_s: float,
-) -> Dict[str, str]:
+) -> List[dict]:
     """
     Split audio into non-overlapping chunks and transcribe with DiCoW.
     For each chunk, slice full_diar_mask[:, f_start:f_end] and set it on the pipeline.
-    Returns {speaker: full_hypothesis_text}.
+    Returns one JSONL-compatible segment per oracle speaker per chunk. Chunk
+    boundaries are used as timing because Whisper timestamps are chunk-relative.
     """
     total_duration = len(audio) / sr
     chunk_samples  = int(chunk_length_s * sr)
     num_chunks     = int(np.ceil(total_duration / chunk_length_s))
 
-    per_spk_hyps: Dict[str, List[str]] = {spk: [] for spk in speakers}
+    hypothesis_rows: List[dict] = []
 
     try:
         for idx in range(num_chunks):
@@ -137,39 +113,41 @@ def transcribe_audio(
             for i, spk in enumerate(speakers):
                 clean = re.sub(r"<\|\d+\.\d+\|>", " ", per_spk_outputs[i])
                 clean = re.sub(r"\s+", " ", clean).strip()
-                per_spk_hyps[spk].append(clean)
+                hypothesis_rows.append(
+                    {
+                        "speaker": spk,
+                        "start_time": chunk_start,
+                        "end_time": chunk_end,
+                        "words": clean,
+                    }
+                )
 
     finally:
         pipeline.diarization_mask = None
 
-    return {spk: " ".join(per_spk_hyps[spk]) for spk in speakers}
+    return hypothesis_rows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Evaluate one file
+# Decode one file
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_file(
     audio_path: str,
     rttm_path: str,
-    tg_path: str,
     pipeline: DiCoW_Pipeline,
     chunk_length_s: float,
-) -> Dict[str, Tuple[str, str]]:
+) -> List[dict]:
     """
-    Evaluate one recording.  Returns {speaker: (hypothesis, reference)}.
+    Decode one recording. The RTTM speaker names are retained as hypothesis
+    labels, which makes this a valid oracle speaker mapping for scoring_dicow.
     """
-    references = load_reference(tg_path)
-
     audio, sr = librosa.load(audio_path, sr=16_000, mono=True)  # resample once here
 
     speakers, full_diar_mask = load_diarization_mask(rttm_path, len(audio) / sr)
     hypotheses = transcribe_audio(audio, sr, speakers, full_diar_mask, pipeline, chunk_length_s)
-
-    return {
-        spk: (hypotheses.get(spk, ""), references.get(spk, ""))
-        for spk in speakers
-    }
+    session_id = Path(audio_path).stem
+    return [{"session_id": session_id, **row} for row in hypotheses]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,6 +174,21 @@ def load_pipeline(model_path: str, device: torch.device) -> DiCoW_Pipeline:
     )
 
 
+def load_latest_scorer(scorer_root: Path):
+    """Load the shared scorer checkout, never this experiment's stale copy."""
+    scorer_src = scorer_root / "src"
+    if not (scorer_src / "scoring_dicow" / "metrics.py").is_file():
+        raise FileNotFoundError(
+            f"Latest scoring_dicow checkout not found at {scorer_root}. "
+            "Set scoring_dicow_root in config.yaml."
+        )
+    sys.path.insert(0, str(scorer_src))
+    from scoring_dicow.config import DatasetConfig, SpeakerMappingConfig
+    from scoring_dicow.metrics import score_dataset
+
+    return DatasetConfig, SpeakerMappingConfig, score_dataset
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,6 +205,17 @@ def main(config_path: str) -> None:
     rttm_dir     = Path(cfg["rttm_dir"])
     tg_dir       = Path(cfg["textgrid_dir"])
     chunk_length = cfg.get("chunk_length_s", 5.0)
+    collar = int(cfg.get("collar", 5))
+    dataset_name = str(cfg.get("dataset_name", audio_dir.parent.name))
+    mapping = str(cfg.get("mapping", dataset_name))
+    testset_root = Path(cfg.get("testset_root", audio_dir.parent.parent))
+    scorer_root = Path(
+        cfg.get(
+            "scoring_dicow_root",
+            Path(__file__).resolve().parents[1] / "scoring_dicow",
+        )
+    )
+    DatasetConfig, SpeakerMappingConfig, score_dataset = load_latest_scorer(scorer_root)
 
     files = sorted(audio_dir.glob("*.wav"))
     print(f"Found {len(files)} files.  Chunk length: {chunk_length}s\n")
@@ -220,46 +224,39 @@ def main(config_path: str) -> None:
     pipeline = load_pipeline(cfg["dicow_model"], device)
     print("Model ready.\n")
 
-    file_wer_lines = []   # recorded per-file WER strings
-    total_s = total_d = total_i = total_h = 0  # dataset-level accumulators
+    hypothesis_rows: List[dict] = []
 
     for audio_path in tqdm(files):
         rttm_path = rttm_dir / (audio_path.stem + ".rttm")
         tg_path   = tg_dir   / (audio_path.stem + ".TextGrid")
 
         print(f"Processing: {audio_path.name}")
-        results = evaluate_file(str(audio_path), str(rttm_path), str(tg_path),
-                                pipeline, chunk_length)
+        if not rttm_path.is_file() or not tg_path.is_file():
+            raise FileNotFoundError(f"Missing RTTM or TextGrid for {audio_path.stem}")
+        hypothesis_rows.extend(
+            evaluate_file(str(audio_path), str(rttm_path), pipeline, chunk_length)
+        )
 
-        # Accumulate counts for this file across all its speakers
-        file_s = file_d = file_i = file_h = 0
-        for spk, (hyp, ref) in results.items():
-            if not ref.strip():
-                continue
-            norm_rows = normalize_rows([{"words": ref}, {"words": hyp}])
-            ref_n, hyp_n = norm_rows[0]["words"], norm_rows[1]["words"]
-            m = jiwer.process_words(ref_n, hyp_n)
-            file_s += m.substitutions
-            file_d += m.deletions
-            file_i += m.insertions
-            file_h += m.hits
+    hypothesis_path = output_dir / "hypothesis_multi.jsonl"
+    with hypothesis_path.open("w", encoding="utf-8") as f:
+        for row in hypothesis_rows:
+            f.write(json.dumps(row) + "\n")
+    print(f"Saved {len(hypothesis_rows)} oracle-labelled segments to {hypothesis_path}")
 
-        file_wer = (file_s + file_d + file_i) / max(1, file_s + file_d + file_h)
-        line = f"{audio_path.stem}  WER = {file_wer:.2%}  (S={file_s} D={file_d} I={file_i} H={file_h})"
-        print(f"  {line}")
-        file_wer_lines.append(line)
-
-        total_s += file_s
-        total_d += file_d
-        total_i += file_i
-        total_h += file_h
-
-    overall = (total_s + total_d + total_i) / max(1, total_s + total_d + total_h)
-    print(f"\n── Dataset WER " + "─" * 50)
-    print(f"  Overall WER = {overall:.2%}  (S={total_s} D={total_d} I={total_i} H={total_h})")
-
-    report = "\n".join(file_wer_lines) + f"\n\nOverall WER = {overall:.4f}\n"
-    (output_dir / f"{chunk_length}s.txt").write_text(report)
+    scorer_output = output_dir / "scoring"
+    summary = score_dataset(
+        testset_root,
+        DatasetConfig(
+            name=dataset_name,
+            predictions=str(hypothesis_path),
+            mapping=mapping,
+            speaker_mapping=SpeakerMappingConfig(mode="oracle"),
+        ),
+        scorer_output,
+        collar=collar,
+    )
+    print(json.dumps(summary["normalized_metrics"], indent=2))
+    print(f"Diagnostics: {scorer_output / 'diagnostic_sessions.jsonl'}")
 
 
 if __name__ == "__main__":
